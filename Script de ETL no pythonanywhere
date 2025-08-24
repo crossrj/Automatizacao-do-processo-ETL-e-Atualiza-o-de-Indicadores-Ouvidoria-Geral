@@ -1,0 +1,125 @@
+import os
+import pandas as pd
+import unicodedata
+import re
+import gspread
+from google.oauth2.service_account import Credentials
+import requests
+import json
+
+# ========================================================
+# CONFIGURAÇÕES DO GOOGLE SHEETS
+# ========================================================
+GOOGLE_SHEETS_ID = "1kXLpi7RLGD-KukI38l9-zEgKQqklbJn1xfVPgmt9spQ"
+NOME_ABA = "Dashboard_Duque_de_Caxias_Ouvidoria_Duque_de_Caxias_Tabela"
+
+# ========================================================
+# CONFIGURAÇÕES SUPABASE
+# ========================================================
+SUPABASE_URL = "https://gcanwuqlykvigpyzhtqk.supabase.co/rest/v1"
+SUPABASE_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdjYW53dXFseWt2aWdweXpodHFrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTg2NTA3NSwiZXhwIjoyMDcxNDQxMDc1fQ.Gy8-anRqNKEIkKIrhPymR9XS6DwujAVZ5J0AcHwMOZY"
+NOME_TABELA_SUPABASE = "Dashboard_Duque_de_Caxias_Ouvidoria_Duque_de_Caxias_Tabela"
+
+# ========================================================
+# CREDENCIAIS GOOGLE SERVICE ACCOUNT (JSON)
+# ========================================================
+CAMINHO_CREDENCIAIS = "/home/niltonjunio/meuprojeto/ouvidoria-tratamento-dados.json"
+
+# ========================================================
+# 1. Conectar ao Google Sheets
+# ========================================================
+creds = Credentials.from_service_account_file(
+    CAMINHO_CREDENCIAIS,
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
+client = gspread.authorize(creds)
+sheet = client.open_by_key(GOOGLE_SHEETS_ID).worksheet(NOME_ABA)
+
+# ========================================================
+# 2. Ler dados do Google Sheets
+# ========================================================
+dados = sheet.get_all_records()
+df = pd.DataFrame(dados)
+
+# ========================================================
+# 3. Normalizar nomes das colunas
+# ========================================================
+def normalizar_nome_coluna(col):
+    col = unicodedata.normalize("NFKD", col).encode("ASCII", "ignore").decode("utf-8")
+    col = col.lower()
+    col = re.sub(r"[^a-z0-9]+", "_", col)
+    col = re.sub(r"_+", "_", col).strip("_")
+    return col
+
+df.columns = [normalizar_nome_coluna(c) for c in df.columns]
+print("Colunas normalizadas:", df.columns.tolist())
+
+# ========================================================
+# 4. Limpeza de nomes de colunas (extra)
+# ========================================================
+df.columns = (
+    df.columns
+    .str.strip()
+    .str.lower()
+    .str.replace(" ", "_")
+    .str.normalize("NFKD")
+    .str.encode("ascii", errors="ignore")
+    .str.decode("utf-8")
+)
+
+# ========================================================
+# 5. Tratamento de valores NaN e padronização de datas
+# ========================================================
+colunas_datas = ["data_da_criacao", "data_da_conclusao"]
+for col in colunas_datas:
+    if col in df.columns:
+        # Normalizar strings (tirar espaços e deixar minúsculo)
+        df[col] = df[col].astype(str).str.strip().str.lower()
+
+        # Substituir textos inválidos por NA
+        df[col] = df[col].replace(
+            [
+                "na", "n/a", "nan", "não informado", "nao informado",
+                "n/d", "null", "none", "não concluído", "nao concluido", ""
+            ],
+            pd.NA
+        )
+
+        # Converter para datetime (aceita formatos ISO e DD/MM/AAAA)
+        df[col] = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+
+        # Formatar tudo em DD/MM/AAAA
+        df[col] = df[col].dt.strftime("%d/%m/%Y")
+
+        # Substituir valores faltantes
+        df[col] = df[col].fillna("Não informado")
+
+# ========================================================
+# 6. Filtrar dados a partir de 01/08/2025
+# ========================================================
+if "data_da_criacao" in df.columns:
+    df_filtrado = pd.to_datetime(df["data_da_criacao"], dayfirst=True, errors="coerce")
+    df = df[df_filtrado >= pd.to_datetime("2025-08-01")]
+
+# ========================================================
+# 7. Envio para o Supabase
+# ========================================================
+url = f"{SUPABASE_URL}/{NOME_TABELA_SUPABASE}"
+headers = {
+    "apikey": SUPABASE_API_KEY,
+    "Authorization": f"Bearer {SUPABASE_API_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates"
+}
+
+lote = 500
+for i in range(0, len(df), lote):
+    chunk = df.iloc[i:i+lote]
+    data_json = chunk.to_dict(orient="records")
+    response = requests.post(url, headers=headers, data=json.dumps(data_json))
+    if response.status_code not in (200, 201):
+        print(f"Erro no lote {i // lote}: {response.text}")
+    else:
+        print(f"Lote {i // lote} enviado com sucesso!")
+
+print("Envio concluído!")
